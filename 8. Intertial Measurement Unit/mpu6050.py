@@ -8,7 +8,6 @@
 # GP0 - SDA
 # GP1 = SCL
 #
-from 
 from imu import MPU6050
 from time import sleep
 from machine import Pin, I2C
