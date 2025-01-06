@@ -1,99 +1,115 @@
 #
-# BLE Server
+# BLEServer
 #
-import sys
-
+# Version 24_07_31_04
+#
+# 
 import aioble
 import bluetooth
-from machine import Pin
-import uasyncio as asyncio
 from micropython import const
+import uasyncio as asyncio
 
-def uid():
-    '''
-    Return the unique id of the defice as a string
-    '''
-    return "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}".format(
-        *machine.unique_id())
-
-MANUFACTURER_ID = const(0x02A29)
-MODEL_NUMBER_ID = const(0x2A24)
-SERIAL_NUMBER_ID = const(0x2A25)
-HARDWARE_REVISION_ID = const(0x2A26)
-BLE_VERSION_ID = const(0x2A28)
-
-_ENV_SENSE_UUID = bluetooth.UUID(0x180A)
-_GENERIC = bluetooth.UUID(0x1848)
-_ENV_SENSE_TEMP_UUID = bluetooth.UUID(0x1800)
-_BUTTON_UUID = bluetooth.UUID(0x2A6E)
-
+_GENERIC_SERVICE_UUID = bluetooth.UUID(0x1848)
+_GENERIC_CHAR_UUID = bluetooth.UUID(0x2A6E)
 _BLE_APPEARANCE_GENERIC_REMOTE_CONTROL = const(384)
 
-# Advertising frequency
-ADV_INTERVAL_MS = 250_000
-
-device_info = aioble.Service(_ENV_SENSE_UUID)
-
-connection = None
-
-# Create characteristics for device info
-aioble.Characteristic(device_info, bluetooth.UUID(MANUFACTURER_ID), read=True, initial="KevsRobotsRemote")
-aioble.Characteristic(device_info, bluetooth.UUID(MODEL_NUMBER_ID), read=True, initial="1.0")
-aioble.Characteristic(device_info, bluetooth.UUID(SERIAL_NUMBER_ID), read=True, initial=uid())
-aioble.Characteristic(device_info, bluetooth.UUID(HARDWARE_REVISION_ID), read=True, initial=sys.version)
-aioble.Characteristic(device_info, bluetooth.UUID(BLE_VERSION_ID), read=True, initial="1.0")
-
-remote_service = aioble.Service(_GENERIC)
-
-button_characteristic = aioble.Characteristic(
-    remote_service,
-    _BUTTON_UUID,
-    read = True,
-    notify = False
-)
-
-print('registering services')
-
-connected = False
-
-# Wait for connection; Don't advertise whie connected
-async def peripheral_task():
-    print('peripheral task')
-    global connected, connection
-    while True:
-        connected = False
-        async with await aioble.advertise(
-            ADV_INTERVAL_MS, 
-            name="Harker BLE Server", 
-            appearance=_BLE_APPEARANCE_GENERIC_REMOTE_CONTROL, 
-            services=[_ENV_SENSE_TEMP_UUID]
-        ) as connection:
-            print("Connection from", connection.device)
-            connected = True
-            print(f"connected: {connected}")
-            await connection.disconnected()
-            print(f'disconnected')
-            
-async def remote_task():
-    '''
-    Send the command
-    '''
-    while True:
-        if connected:
-            print('sent')
-            button_characteristic.write(b'a')
-            button_characteristic.notify(connection, b'a')
-            await asyncio.sleep_ms(1000)
-        else:
-            print('not connected')
-            await asyncio.sleep_ms(1000)
+class BLEServer:
+    """Class to create a BLE server that advertises a service and characteristic.
+    This class can be instantiated and provided with a function that creates a message
+    to be sent by the server. The message is sent at a regular interval.
+    """
     
+    def __init__(self,
+                 name:str,
+                 create_message_func=None,
+                 on_connected_func=None,
+                 on_disconnected_func=None,
+                 send_interval_ms:int=1000,
+                 service_uuid:bluetooth.UUID=_GENERIC_SERVICE_UUID,
+                 char_uuid:bluetooth.UUID=_GENERIC_CHAR_UUID)->None:
+        """Initialize the BLEServer object.
 
-async def main():
-    tasks = [
-        asyncio.create_task(peripheral_task()),
-        asyncio.create_task(remote_task())
-    ]
-    await asyncio.gather(*tasks)
+        Args:
+            name (str): Name of the BLE server. This is used by the client to recognize the server.
+            create_message_func (_type_, optional): User-proviced function that provides a string to 
+                be sent by the server. Defaults to None.
+            send_interval_ms (int, optional): Interval between sends, in ms. Defaults to 1000.
+            service_uuid (UUID, optional): Service UUID. Defaults to _GENERIC_SERVICE_UUID.
+            char_uuid (UUID, optional): Characteristic UUID. Defaults to _GENERIC_CHAR_UUID.
+        """
+        self.name = name
+        self.create_message_func = create_message_func
+        self.on_connected_func = on_connected_func
+        self.on_disconnected_func = on_disconnected_func
+        self.send_interval_ms = send_interval_ms
+        self.service_uuid = service_uuid
+        self.char_uuid = char_uuid
+        self.connection = None
+        self.characteristic = None
+        self.createService()
+        
+    def start(self)->None:
+        asyncio.run(self.run_loop())
+        
+    async def run_loop(self)->None:
+        while True:
+            try:
+                if self.is_connected():
+                    await self.send_message()
+                    await asyncio.sleep_ms(self.send_interval_ms)
+                else:
+                    if self.connection and self.on_disconnected_func:
+                        self.on_disconnected_func()
+                    await self.connect_to_client()
+                    if self.on_connected_func:
+                        self.on_connected_func()
+            except Exception as e:
+                print(f'Exception: {e}')
+                self.connection = None          
+                
+    def is_connected(self)->bool:
+        return not self.connection == None and self.connection.is_connected() 
+             
+        
+    async def send_message(self)->None:
+        message_str = 'x'
+        if not self.create_message_func == None:
+            message_str = self.create_message_func()
+        message = bytearray(message_str, 'utf-8')
+        self.characteristic.write(message)
+        self.characteristic.notify(self.connection, message)
+        
+    async def connect_to_client(self)->None:
+        print('Advertising...',end='')
+        self.connection = await aioble.advertise(
+                1000, 
+                name=self.name, 
+                appearance=_BLE_APPEARANCE_GENERIC_REMOTE_CONTROL, 
+                services=[self.service_uuid]
+        )
+        print("connected to:", self.connection.device)
+        print(f'Is connected: {self.connection.is_connected()}')
+        
+    def createService(self):
+        """Create the service and characteristic for the BLE server and registers
+        the service. This function is called during initialization.
+        """
+        print('createService')
+        service = aioble.Service(self.service_uuid)
+        self.characteristic = aioble.Characteristic(
+            service,
+            self.char_uuid,
+            read = True,
+            notify = True
+        )
+        aioble.register_services(service)
     
-asyncio.run(main())
+    
+if __name__ == "__main__":
+    try:
+        bleServer = BLEServer('JoystickController')
+        bleServer.start()
+    
+    except KeyboardInterrupt:
+        print('Program terminated')
+        
